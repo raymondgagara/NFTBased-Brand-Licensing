@@ -230,3 +230,102 @@
     )
   )
 )
+
+
+(define-constant err-not-for-sale (err u106))
+(define-constant err-price-not-met (err u107))
+
+;; Add this map to track listings
+(define-map license-listings
+  { license-id: uint }
+  { 
+    price: uint,
+    seller: principal
+  }
+)
+
+;; Read-only function to check if a license is for sale
+(define-read-only (get-license-listing (license-id uint))
+  (map-get? license-listings { license-id: license-id })
+)
+
+;; List a license for sale
+(define-public (list-license-for-sale (license-id uint) (price uint))
+  (let ((owner (unwrap! (nft-get-owner? brand-license license-id) err-not-found)))
+    (asserts! (is-eq tx-sender owner) err-unauthorized)
+    (asserts! (> price u0) err-invalid-params)
+    
+    ;; Check if license is valid
+    (asserts! (is-eq (unwrap! (is-license-valid license-id) err-not-found) true) err-expired)
+    
+    (map-set license-listings
+      { license-id: license-id }
+      { 
+        price: price,
+        seller: tx-sender
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Cancel a listing
+(define-public (cancel-license-listing (license-id uint))
+  (let ((listing (map-get? license-listings { license-id: license-id })))
+    (asserts! (is-some listing) err-not-found)
+    (asserts! (is-eq tx-sender (get seller (unwrap-panic listing))) err-unauthorized)
+    
+    (map-delete license-listings { license-id: license-id })
+    (ok true)
+  )
+)
+
+;; Purchase a listed license
+(define-public (purchase-license (license-id uint))
+  (let ((listing (map-get? license-listings { license-id: license-id })))
+    (asserts! (is-some listing) err-not-for-sale)
+    
+    (let ((listing-data (unwrap-panic listing))
+          (price (get price listing-data))
+          (seller (get seller listing-data)))
+      
+      ;; Transfer STX from buyer to seller
+      (try! (stx-transfer? price tx-sender seller))
+      
+      ;; Transfer the NFT
+      (try! (nft-transfer? brand-license license-id seller tx-sender))
+      
+      ;; Update license details
+      (let ((license (map-get? license-details { license-id: license-id })))
+        (asserts! (is-some license) err-not-found)
+        (map-set license-details
+          { license-id: license-id }
+          (merge (unwrap-panic license) { licensee: tx-sender })
+        )
+      )
+      
+      ;; Remove the listing
+      (map-delete license-listings { license-id: license-id })
+      
+      (ok true)
+    )
+  )
+)
+
+
+(define-public (get-licensee-payments (licensee principal) (brand-id uint))
+  (let ((payments (map-get? licensee-payments { licensee: licensee, brand-id: brand-id })))
+    (if (is-some payments)
+      (ok (get total-paid (unwrap-panic payments)))
+      (ok u0)
+    )
+  )
+)
+(define-public (get-brand-royalties (brand-id uint))
+  (let ((royalties (map-get? brand-royalties { brand-id: brand-id })))
+    (if (is-some royalties)
+      (ok (get royalties-collected (unwrap-panic royalties)))
+      (ok u0)
+    )
+  )
+)
