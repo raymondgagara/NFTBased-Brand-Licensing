@@ -10,6 +10,21 @@
 
 (define-data-var next-license-id uint u1)
 
+(define-constant err-renewal-not-configured (err u111))
+(define-constant err-not-renewable (err u112))
+(define-constant err-renewal-payment-failed (err u113))
+
+(define-map license-renewal-config
+  { license-id: uint }
+  {
+    auto-renew: bool,
+    renewal-period: uint,
+    renewal-fee: uint,
+    max-renewals: uint,
+    current-renewals: uint
+  }
+)
+
 (define-map brand-details
   { brand-id: uint }
   {
@@ -685,6 +700,171 @@
           (ok u0)
         )
       )
+    )
+  )
+)
+
+
+
+(define-read-only (get-renewal-config (license-id uint))
+  (map-get? license-renewal-config { license-id: license-id })
+)
+
+(define-read-only (can-renew-license (license-id uint))
+  (let (
+    (license (map-get? license-details { license-id: license-id }))
+    (config (map-get? license-renewal-config { license-id: license-id }))
+  )
+    (if (and (is-some license) (is-some config))
+      (let (
+        (license-data (unwrap-panic license))
+        (config-data (unwrap-panic config))
+      )
+        (if (get revoked license-data)
+          (ok false)
+          (if (> (get max-renewals config-data) (get current-renewals config-data))
+            (ok true)
+            (ok false)
+          )
+        )
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-public (configure-renewal (license-id uint) (auto-renew bool) (renewal-period uint) (renewal-fee uint) (max-renewals uint))
+  (let ((license (map-get? license-details { license-id: license-id })))
+    (asserts! (is-some license) err-not-found)
+    (let (
+      (license-data (unwrap-panic license))
+      (brand-id (get brand-id license-data))
+      (brand (map-get? brand-details { brand-id: brand-id }))
+    )
+      (asserts! (is-some brand) err-not-found)
+      (asserts! (is-eq tx-sender (get owner (unwrap-panic brand))) err-owner-only)
+      (asserts! (> renewal-period u0) err-invalid-params)
+      (asserts! (> max-renewals u0) err-invalid-params)
+      
+      (map-set license-renewal-config
+        { license-id: license-id }
+        {
+          auto-renew: auto-renew,
+          renewal-period: renewal-period,
+          renewal-fee: renewal-fee,
+          max-renewals: max-renewals,
+          current-renewals: u0
+        }
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (renew-license (license-id uint))
+  (let (
+    (license (map-get? license-details { license-id: license-id }))
+    (config (map-get? license-renewal-config { license-id: license-id }))
+  )
+    (asserts! (is-some license) err-not-found)
+    (asserts! (is-some config) err-renewal-not-configured)
+    
+    (let (
+      (license-data (unwrap-panic license))
+      (config-data (unwrap-panic config))
+      (brand-id (get brand-id license-data))
+      (brand (map-get? brand-details { brand-id: brand-id }))
+    )
+      (asserts! (is-some brand) err-not-found)
+      (asserts! (not (get revoked license-data)) err-expired)
+      (asserts! (> (get max-renewals config-data) (get current-renewals config-data)) err-not-renewable)
+      
+      (let (
+        (brand-owner (get owner (unwrap-panic brand)))
+        (renewal-fee (get renewal-fee config-data))
+        (renewal-period (get renewal-period config-data))
+        (current-expiry (get expires-at license-data))
+        (new-expiry (+ current-expiry renewal-period))
+      )
+        (if (> renewal-fee u0)
+          (try! (stx-transfer? renewal-fee tx-sender brand-owner))
+          true
+        )
+        
+        (map-set license-details
+          { license-id: license-id }
+          (merge license-data { expires-at: new-expiry })
+        )
+        
+        (map-set license-renewal-config
+          { license-id: license-id }
+          (merge config-data { current-renewals: (+ (get current-renewals config-data) u1) })
+        )
+        
+        (if (> renewal-fee u0)
+          (begin
+            (map-set brand-royalties
+              { brand-id: brand-id }
+              { royalties-collected: (+ (get-royalties-collected brand-id) renewal-fee) }
+            )
+            (let ((current-paid (default-to { total-paid: u0 } (map-get? licensee-payments { licensee: tx-sender, brand-id: brand-id }))))
+              (map-set licensee-payments
+                { licensee: tx-sender, brand-id: brand-id }
+                { total-paid: (+ (get total-paid current-paid) renewal-fee) }
+              )
+            )
+          )
+          true
+        )
+        
+        (ok new-expiry)
+      )
+    )
+  )
+)
+
+(define-public (auto-renew-license (license-id uint))
+  (let (
+    (license (map-get? license-details { license-id: license-id }))
+    (config (map-get? license-renewal-config { license-id: license-id }))
+  )
+    (asserts! (is-some license) err-not-found)
+    (asserts! (is-some config) err-renewal-not-configured)
+    
+    (let (
+      (license-data (unwrap-panic license))
+      (config-data (unwrap-panic config))
+    )
+      (asserts! (get auto-renew config-data) err-not-renewable)
+      (asserts! (is-eq tx-sender (get licensee license-data)) err-unauthorized)
+      (asserts! (<= (get expires-at license-data) (+ stacks-block-height u144)) err-invalid-params)
+      
+      (renew-license license-id)
+    )
+  )
+)
+
+(define-public (disable-auto-renewal (license-id uint))
+  (let (
+    (license (map-get? license-details { license-id: license-id }))
+    (config (map-get? license-renewal-config { license-id: license-id }))
+  )
+    (asserts! (is-some license) err-not-found)
+    (asserts! (is-some config) err-renewal-not-configured)
+    
+    (let (
+      (license-data (unwrap-panic license))
+      (config-data (unwrap-panic config))
+    )
+      (asserts! (is-eq tx-sender (get licensee license-data)) err-unauthorized)
+      
+      (map-set license-renewal-config
+        { license-id: license-id }
+        (merge config-data { auto-renew: false })
+      )
+      
+      (ok true)
     )
   )
 )
