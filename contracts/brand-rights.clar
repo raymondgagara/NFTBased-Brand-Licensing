@@ -868,3 +868,299 @@
     )
   )
 )
+
+;; License Verification & Authenticity System
+;; Provides third-party verification capabilities for license authenticity
+
+(define-constant err-verification-not-found (err u114))
+(define-constant err-verification-expired (err u115))
+(define-constant err-invalid-verification-token (err u116))
+(define-constant err-verification-disabled (err u117))
+
+;; Counter for unique verification tokens
+(define-data-var next-verification-id uint u1)
+
+;; Store verification tokens for each license
+(define-map license-verification-tokens
+  { license-id: uint }
+  {
+    verification-token: uint,
+    token-created-at: uint,
+    verification-enabled: bool,
+    public-verification: bool,
+    verification-count: uint
+  }
+)
+
+;; Track verification attempts and history
+(define-map verification-attempts
+  { verification-token: uint, attempt-id: uint }
+  {
+    verifier: principal,
+    verified-at: uint,
+    verification-result: bool,
+    license-id: uint,
+    verification-details: (string-ascii 128)
+  }
+)
+
+;; Counter for verification attempts per token
+(define-map verification-counters
+  { verification-token: uint }
+  { next-attempt-id: uint }
+)
+
+;; Verification settings per brand
+(define-map brand-verification-settings
+  { brand-id: uint }
+  {
+    require-verification: bool,
+    public-verification-allowed: bool,
+    verification-fee: uint,
+    max-verifications-per-day: uint
+  }
+)
+
+;; Daily verification tracking
+(define-map daily-verification-count
+  { verification-token: uint, day: uint }
+  { count: uint }
+)
+
+;; Read-only function to get verification token details
+(define-read-only (get-verification-token (license-id uint))
+  (map-get? license-verification-tokens { license-id: license-id })
+)
+
+;; Read-only function to get brand verification settings
+(define-read-only (get-brand-verification-settings (brand-id uint))
+  (map-get? brand-verification-settings { brand-id: brand-id })
+)
+
+;; Read-only function to get verification attempt details
+(define-read-only (get-verification-attempt (verification-token uint) (attempt-id uint))
+  (map-get? verification-attempts { verification-token: verification-token, attempt-id: attempt-id })
+)
+
+;; Map to store verification token to license mappings for efficient lookup
+(define-map token-to-license
+  { verification-token: uint }
+  { license-id: uint }
+)
+
+;; Public function to verify license authenticity by token
+(define-read-only (verify-license-by-token (verification-token uint))
+  (let ((token-mapping (map-get? token-to-license { verification-token: verification-token })))
+    (if (is-some token-mapping)
+      (let (
+        (license-id (get license-id (unwrap-panic token-mapping)))
+        (license (map-get? license-details { license-id: license-id }))
+        (token-data (map-get? license-verification-tokens { license-id: license-id }))
+      )
+        (if (and (is-some license) (is-some token-data))
+          (let (
+            (license-data (unwrap-panic license))
+            (token-info (unwrap-panic token-data))
+          )
+            (if (not (get verification-enabled token-info))
+              err-verification-disabled
+              (if (get revoked license-data)
+                (ok { valid: false, reason: "license-revoked", license-id: license-id })
+                (if (> (get expires-at license-data) stacks-block-height)
+                  (ok { valid: true, reason: "license-active", license-id: license-id })
+                  (ok { valid: false, reason: "license-expired", license-id: license-id })
+                )
+              )
+            )
+          )
+          err-verification-not-found
+        )
+      )
+      err-invalid-verification-token
+    )
+  )
+)
+
+;; Configure verification settings for a brand
+(define-public (configure-brand-verification (brand-id uint) (require-verification bool) (public-verification-allowed bool) (verification-fee uint) (max-verifications-per-day uint))
+  (let ((brand (map-get? brand-details { brand-id: brand-id })))
+    (asserts! (is-some brand) err-not-found)
+    (asserts! (is-eq tx-sender (get owner (unwrap-panic brand))) err-owner-only)
+    
+    (map-set brand-verification-settings
+      { brand-id: brand-id }
+      {
+        require-verification: require-verification,
+        public-verification-allowed: public-verification-allowed,
+        verification-fee: verification-fee,
+        max-verifications-per-day: max-verifications-per-day
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Generate verification token for a license
+(define-public (generate-verification-token (license-id uint) (public-verification bool))
+  (let ((license (map-get? license-details { license-id: license-id })))
+    (asserts! (is-some license) err-not-found)
+    
+    (let (
+      (license-data (unwrap-panic license))
+      (brand-id (get brand-id license-data))
+      (brand (map-get? brand-details { brand-id: brand-id }))
+    )
+      (asserts! (is-some brand) err-not-found)
+      (asserts! (is-eq tx-sender (get owner (unwrap-panic brand))) err-owner-only)
+      
+      (let ((verification-token (var-get next-verification-id)))
+        (map-set license-verification-tokens
+          { license-id: license-id }
+          {
+            verification-token: verification-token,
+            token-created-at: stacks-block-height,
+            verification-enabled: true,
+            public-verification: public-verification,
+            verification-count: u0
+          }
+        )
+        
+        ;; Store token-to-license mapping for efficient lookup
+        (map-set token-to-license
+          { verification-token: verification-token }
+          { license-id: license-id }
+        )
+        
+        (map-set verification-counters
+          { verification-token: verification-token }
+          { next-attempt-id: u1 }
+        )
+        
+        (var-set next-verification-id (+ verification-token u1))
+        (ok verification-token)
+      )
+    )
+  )
+)
+
+;; Perform verification attempt with detailed logging
+(define-public (perform-verification (verification-token uint) (verification-details (string-ascii 128)))
+  (let ((token-mapping (map-get? token-to-license { verification-token: verification-token })))
+    (asserts! (is-some token-mapping) err-invalid-verification-token)
+    
+    (let (
+      (license-id (get license-id (unwrap-panic token-mapping)))
+      (license (unwrap! (map-get? license-details { license-id: license-id }) err-not-found))
+      (token-data (unwrap! (map-get? license-verification-tokens { license-id: license-id }) err-verification-not-found))
+      (counter-data (default-to { next-attempt-id: u1 } (map-get? verification-counters { verification-token: verification-token })))
+      (attempt-id (get next-attempt-id counter-data))
+    )
+      (asserts! (get verification-enabled token-data) err-verification-disabled)
+      
+      (let (
+        (license-data license)
+        (is-valid (and (not (get revoked license-data)) (> (get expires-at license-data) stacks-block-height)))
+        (current-day (/ stacks-block-height u144))
+        (daily-count (default-to { count: u0 } (map-get? daily-verification-count { verification-token: verification-token, day: current-day })))
+        (brand-settings (map-get? brand-verification-settings { brand-id: (get brand-id license-data) }))
+      )
+        ;; Check brand verification settings
+        (if (is-some brand-settings)
+          (let ((settings (unwrap-panic brand-settings)))
+            (asserts! (< (get count daily-count) (get max-verifications-per-day settings)) err-invalid-params)
+            
+            ;; Check if public verification is allowed
+            (if (not (get public-verification token-data))
+              (asserts! (get public-verification-allowed settings) err-unauthorized)
+              true
+            )
+            
+            ;; Process verification fee if required
+            (if (> (get verification-fee settings) u0)
+              (let ((brand-data (unwrap! (map-get? brand-details { brand-id: (get brand-id license-data) }) err-not-found)))
+                (try! (stx-transfer? (get verification-fee settings) tx-sender (get owner brand-data)))
+              )
+              true
+            )
+          )
+          true
+        )
+        
+        ;; Log verification attempt
+        (map-set verification-attempts
+          { verification-token: verification-token, attempt-id: attempt-id }
+          {
+            verifier: tx-sender,
+            verified-at: stacks-block-height,
+            verification-result: is-valid,
+            license-id: license-id,
+            verification-details: verification-details
+          }
+        )
+        
+        ;; Update counters
+        (map-set verification-counters
+          { verification-token: verification-token }
+          { next-attempt-id: (+ attempt-id u1) }
+        )
+        
+        (map-set license-verification-tokens
+          { license-id: license-id }
+          (merge token-data { verification-count: (+ (get verification-count token-data) u1) })
+        )
+        
+        (map-set daily-verification-count
+          { verification-token: verification-token, day: current-day }
+          { count: (+ (get count daily-count) u1) }
+        )
+        
+        (ok { 
+          verification-result: {
+            valid: is-valid,
+            reason: (if is-valid "license-active" (if (get revoked license-data) "license-revoked" "license-expired")),
+            license-id: license-id
+          },
+          attempt-id: attempt-id 
+        })
+      )
+    )
+  )
+)
+
+;; Disable verification for a license
+(define-public (disable-verification (license-id uint))
+  (let ((license (map-get? license-details { license-id: license-id })))
+    (asserts! (is-some license) err-not-found)
+    
+    (let (
+      (license-data (unwrap-panic license))
+      (brand-id (get brand-id license-data))
+      (brand (map-get? brand-details { brand-id: brand-id }))
+      (token-data (map-get? license-verification-tokens { license-id: license-id }))
+    )
+      (asserts! (is-some brand) err-not-found)
+      (asserts! (is-some token-data) err-verification-not-found)
+      (asserts! (is-eq tx-sender (get owner (unwrap-panic brand))) err-owner-only)
+      
+      (map-set license-verification-tokens
+        { license-id: license-id }
+        (merge (unwrap-panic token-data) { verification-enabled: false })
+      )
+      
+      (ok true)
+    )
+  )
+)
+
+;; Get verification statistics for a license
+(define-read-only (get-verification-stats (license-id uint))
+  (let ((token-data (map-get? license-verification-tokens { license-id: license-id })))
+    (if (is-some token-data)
+      (ok (unwrap-panic token-data))
+      err-verification-not-found
+    )
+  )
+)
+
+
